@@ -52,10 +52,51 @@ using namespace std;
 
 static const int PME_ORDER = 5;
 
+// Size (in bytes) of the per-thread "touched" bitmap companion to each
+// PME grid. One bit per grid cell; +1 byte of padding so that the
+// unaligned 16-bit read in scatter_add4 cannot overrun.
+static inline size_t touchedBitmapSize(int gridx, int gridy, int gridz) {
+    return ((size_t)gridx*gridy*gridz + 7) / 8 + 1;
+}
+
+// Scatter-add a 4-lane SIMD vector into grid at consecutive index idx,
+// treating cells whose bit is unset as logical zero (the bitmap is the
+// step's zero-state; the grid is its lazy backing store).
+static inline void scatter_add4(float* grid, uint8_t* touched, int idx, fvec4 add) {
+    int byte = idx >> 3;
+    int shift = idx & 7;
+    // Read up to 4 bits spanning at most 2 bytes (byte and byte+1).
+    uint32_t b0 = touched[byte];
+    uint32_t b1 = touched[byte+1];
+    uint32_t bits = ((b0 | (b1 << 8)) >> shift) & 0xF;
+    fvec4 mask = fvec4::expandBitsToMask((int)bits);
+    fvec4 g(&grid[idx]);
+    ((g & mask) + add).store(&grid[idx]);
+    // Mark the 4 cells touched.
+    uint32_t set = (uint32_t)0xF << shift;
+    touched[byte]   = (uint8_t)(b0 | (set & 0xFF));
+    touched[byte+1] = (uint8_t)(b1 | ((set >> 8) & 0xFF));
+}
+
+// Scatter-add a scalar into grid at idx. First write to a cell overwrites
+// its stale value; subsequent writes accumulate.
+static inline void scatter_add1(float* grid, uint8_t* touched, int idx, float add) {
+    int byte = idx >> 3;
+    int shift = idx & 7;
+    uint8_t bit = (uint8_t)(1 << shift);
+    uint8_t cur = touched[byte];
+    if (cur & bit) {
+        grid[idx] += add;
+    } else {
+        grid[idx] = add;
+        touched[byte] = (uint8_t)(cur | bit);
+    }
+}
+
 bool CpuCalcDispersionPmeReciprocalForceKernel::hasInitializedThreads = false;
 int CpuCalcDispersionPmeReciprocalForceKernel::numThreads = 0;
 
-static void spreadCharge(float* posq, vector<float>& grid, int gridx, int gridy, int gridz, int numParticles, Vec3* periodicBoxVectors, Vec3* recipBoxVectors,
+static void spreadCharge(float* posq, vector<float>& grid, vector<uint8_t>& touched, int gridx, int gridy, int gridz, int numParticles, Vec3* periodicBoxVectors, Vec3* recipBoxVectors,
         atomic<int>& atomicCounter, const float epsilonFactor, int threadIndex, int numThreads, bool deterministic) {
     float temp[4];
     fvec4 boxSize((float) periodicBoxVectors[0][0], (float) periodicBoxVectors[1][1], (float) periodicBoxVectors[2][2], 0);
@@ -68,7 +109,12 @@ static void spreadCharge(float* posq, vector<float>& grid, int gridx, int gridy,
     fvec4 one(1);
     fvec4 scale(1.0f/(PME_ORDER-1));
     float posInBox[4] = {0,0,0,0};
-    memset(grid.data(), 0, sizeof(float)*gridx*gridy*gridz);
+    // Clear only the touched-bitmap (32x smaller than the grid). The
+    // grid itself is left holding stale values from the prior step; the
+    // bitmap encodes "logical zero" so scatter reads mask stale data.
+    float* gridPtr = grid.data();
+    uint8_t* touchedPtr = touched.data();
+    memset(touchedPtr, 0, touched.size());
 
     const int groupSize = max(1, numParticles / (10 * numThreads));
     int start = groupSize * threadIndex;
@@ -136,8 +182,8 @@ static void spreadCharge(float* posq, vector<float>& grid, int gridx, int gridy,
                         ybase = xbase + ybase*gridz;
                         float multiplier = xdata*data[iy][1];
                         fvec4 add0to3 = zdata0to3*multiplier;
-                        (fvec4(&grid[ybase+gridIndexZ])+add0to3).store(&grid[ybase+gridIndexZ]);
-                        grid[ybase+zindex[4]] += multiplier*zdata4;
+                        scatter_add4(gridPtr, touchedPtr, ybase+gridIndexZ, add0to3);
+                        scatter_add1(gridPtr, touchedPtr, ybase+zindex[4], multiplier*zdata4);
                     }
                 }
             }
@@ -154,11 +200,11 @@ static void spreadCharge(float* posq, vector<float>& grid, int gridx, int gridy,
                         float multiplier = xdata*data[iy][1];
                         fvec4 add0to3 = zdata0to3*multiplier;
                         add0to3.store(temp);
-                        grid[ybase+zindex[0]] += temp[0];
-                        grid[ybase+zindex[1]] += temp[1];
-                        grid[ybase+zindex[2]] += temp[2];
-                        grid[ybase+zindex[3]] += temp[3];
-                        grid[ybase+zindex[4]] += multiplier*zdata4;
+                        scatter_add1(gridPtr, touchedPtr, ybase+zindex[0], temp[0]);
+                        scatter_add1(gridPtr, touchedPtr, ybase+zindex[1], temp[1]);
+                        scatter_add1(gridPtr, touchedPtr, ybase+zindex[2], temp[2]);
+                        scatter_add1(gridPtr, touchedPtr, ybase+zindex[3], temp[3]);
+                        scatter_add1(gridPtr, touchedPtr, ybase+zindex[4], multiplier*zdata4);
                     }
                 }
             }
@@ -563,6 +609,7 @@ void CpuCalcPmeReciprocalForceKernel::initialize(int xsize, int ysize, int zsize
     // Initialize the FFT grids.
 
     realGrids.resize(numThreads, vector<float>(gridx*gridy*gridz+3));
+    touchedGrids.resize(numThreads, vector<uint8_t>(touchedBitmapSize(gridx, gridy, gridz)));
     complexGrid.resize(gridx*gridy*(gridz/2+1));
     
     // Initialize the b-spline moduli.
@@ -699,13 +746,24 @@ void CpuCalcPmeReciprocalForceKernel::runWorkerThread(ThreadPool& threads, int i
     int complexStart = std::max(1, ((index*complexSize)/numThreads));
     int complexEnd = (((index+1)*complexSize)/numThreads);
     const float epsilonFactor = sqrt(ONE_4PI_EPS0);
-    spreadCharge(posq, realGrids[index], gridx, gridy, gridz, numParticles, periodicBoxVectors, recipBoxVectors, atomicCounter, epsilonFactor, index, numThreads, deterministic);
+    spreadCharge(posq, realGrids[index], touchedGrids[index], gridx, gridy, gridz, numParticles, periodicBoxVectors, recipBoxVectors, atomicCounter, epsilonFactor, index, numThreads, deterministic);
     threads.syncThreads();
     int numGrids = realGrids.size();
+    // Reduce per-thread grids into realGrids[0], honoring each thread's
+    // touched-bitmap. Untouched cells contribute logical zero, so stale
+    // values from prior steps never enter the sum. gridStart/gridEnd are
+    // multiples of 4, so the 4 bits per chunk always fit in one byte.
     for (int i = gridStart; i < gridEnd; i += 4) {
-        fvec4 sum(&realGrids[0][i]);
-        for (int j = 1; j < numGrids; j++)
-            sum += fvec4(&realGrids[j][i]);
+        int byte = i >> 3;
+        int shift = i & 7;
+        fvec4 sum(0.0f);
+        for (int j = 0; j < numGrids; j++) {
+            uint32_t bits = ((uint32_t)touchedGrids[j][byte] >> shift) & 0xF;
+            if (bits == 0)
+                continue;
+            fvec4 mask = fvec4::expandBitsToMask((int)bits);
+            sum = sum + (fvec4(&realGrids[j][i]) & mask);
+        }
         sum.store(&realGrids[0][i]);
     }
     threads.syncThreads();
@@ -864,6 +922,7 @@ void CpuCalcDispersionPmeReciprocalForceKernel::initialize(int xsize, int ysize,
     // Initialize the FFT grids.
 
     realGrids.resize(numThreads, vector<float>(gridx*gridy*gridz+3));
+    touchedGrids.resize(numThreads, vector<uint8_t>(touchedBitmapSize(gridx, gridy, gridz)));
     complexGrid.resize(gridx*gridy*(gridz/2+1));
     
     // Initialize the b-spline moduli.
@@ -985,13 +1044,22 @@ void CpuCalcDispersionPmeReciprocalForceKernel::runWorkerThread(ThreadPool& thre
     int complexStart = std::max(1, ((index*complexSize)/numThreads));
     int complexEnd = (((index+1)*complexSize)/numThreads);
     const float epsilonFactor = 1.0f;
-    spreadCharge(posq, realGrids[index], gridx, gridy, gridz, numParticles, periodicBoxVectors, recipBoxVectors, atomicCounter, epsilonFactor, index, numThreads, deterministic);
+    spreadCharge(posq, realGrids[index], touchedGrids[index], gridx, gridy, gridz, numParticles, periodicBoxVectors, recipBoxVectors, atomicCounter, epsilonFactor, index, numThreads, deterministic);
     threads.syncThreads();
     int numGrids = realGrids.size();
+    // Reduce per-thread grids into realGrids[0] using the touched-bitmaps;
+    // see CpuCalcPmeReciprocalForceKernel::runWorkerThread for details.
     for (int i = gridStart; i < gridEnd; i += 4) {
-        fvec4 sum(&realGrids[0][i]);
-        for (int j = 1; j < numGrids; j++)
-            sum += fvec4(&realGrids[j][i]);
+        int byte = i >> 3;
+        int shift = i & 7;
+        fvec4 sum(0.0f);
+        for (int j = 0; j < numGrids; j++) {
+            uint32_t bits = ((uint32_t)touchedGrids[j][byte] >> shift) & 0xF;
+            if (bits == 0)
+                continue;
+            fvec4 mask = fvec4::expandBitsToMask((int)bits);
+            sum = sum + (fvec4(&realGrids[j][i]) & mask);
+        }
         sum.store(&realGrids[0][i]);
     }
     threads.syncThreads();
