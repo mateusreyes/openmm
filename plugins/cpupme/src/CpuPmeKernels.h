@@ -38,6 +38,8 @@
 #include <atomic>
 #include <complex>
 #include <condition_variable>
+#include <cstdint>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -123,7 +125,9 @@ private:
     std::vector<float> recipEterm;
     Vec3 lastBoxVectors[3];
     std::vector<float> threadEnergy;
-    std::vector<std::vector<float> > realGrids;
+    std::vector<float> realGrid;
+    std::unique_ptr<std::atomic<std::int64_t>[]> atomicGrid;
+    std::size_t atomicGridSize;
     std::vector<std::complex<float> > complexGrid;
     std::vector<std::size_t> gridShape, fftAxes;
     std::vector<std::ptrdiff_t> realGridStride, complexGridStride;
@@ -217,7 +221,9 @@ private:
     std::vector<float> recipEterm;
     Vec3 lastBoxVectors[3];
     std::vector<float> threadEnergy;
-    std::vector<std::vector<float> > realGrids;
+    std::vector<float> realGrid;
+    std::unique_ptr<std::atomic<std::int64_t>[]> atomicGrid;
+    std::size_t atomicGridSize;
     std::vector<std::complex<float> > complexGrid;
     std::vector<std::size_t> gridShape, fftAxes;
     std::vector<std::ptrdiff_t> realGridStride, complexGridStride;
