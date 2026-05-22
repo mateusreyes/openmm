@@ -59,10 +59,40 @@ static const int PME_ORDER = 5;
 static const long long PME_FIXED_POINT_SCALE = 0x100000000LL;
 static const float PME_FIXED_POINT_THRESHOLD = 2.3e-10f;
 
-static inline void atomicSpreadAdd(std::atomic<int64_t>* grid, int idx, float value) {
+static inline void atomicSpreadAdd1(std::atomic<int64_t>* grid, int idx, float value) {
     if (fabsf(value) > PME_FIXED_POINT_THRESHOLD)
         grid[idx].fetch_add((int64_t)((double)value * (double)PME_FIXED_POINT_SCALE),
                             std::memory_order_relaxed);
+}
+
+// SIMD-batched add of four contiguous cells. The threshold test is one
+// SSE compare + movemask, replacing four scalar fabsf + branch sequences.
+// Lanes whose magnitude would round to zero in fixed point are skipped
+// so we don't pay a wasted LOCK XADD.
+static inline void atomicSpreadAdd4(std::atomic<int64_t>* grid, int base, fvec4 adds4) {
+    int mask = _mm_movemask_ps((abs(adds4) > fvec4(PME_FIXED_POINT_THRESHOLD)).val);
+    if (mask == 0)
+        return;
+    float v[4];
+    adds4.store(v);
+    if (mask & 1) grid[base+0].fetch_add((int64_t)((double)v[0] * (double)PME_FIXED_POINT_SCALE), std::memory_order_relaxed);
+    if (mask & 2) grid[base+1].fetch_add((int64_t)((double)v[1] * (double)PME_FIXED_POINT_SCALE), std::memory_order_relaxed);
+    if (mask & 4) grid[base+2].fetch_add((int64_t)((double)v[2] * (double)PME_FIXED_POINT_SCALE), std::memory_order_relaxed);
+    if (mask & 8) grid[base+3].fetch_add((int64_t)((double)v[3] * (double)PME_FIXED_POINT_SCALE), std::memory_order_relaxed);
+}
+
+// Scatter variant for the z-wrap fallback where the four cells are
+// not contiguous.
+static inline void atomicSpreadAddScatter4(std::atomic<int64_t>* grid, const int* idx, fvec4 adds4) {
+    int mask = _mm_movemask_ps((abs(adds4) > fvec4(PME_FIXED_POINT_THRESHOLD)).val);
+    if (mask == 0)
+        return;
+    float v[4];
+    adds4.store(v);
+    if (mask & 1) grid[idx[0]].fetch_add((int64_t)((double)v[0] * (double)PME_FIXED_POINT_SCALE), std::memory_order_relaxed);
+    if (mask & 2) grid[idx[1]].fetch_add((int64_t)((double)v[1] * (double)PME_FIXED_POINT_SCALE), std::memory_order_relaxed);
+    if (mask & 4) grid[idx[2]].fetch_add((int64_t)((double)v[2] * (double)PME_FIXED_POINT_SCALE), std::memory_order_relaxed);
+    if (mask & 8) grid[idx[3]].fetch_add((int64_t)((double)v[3] * (double)PME_FIXED_POINT_SCALE), std::memory_order_relaxed);
 }
 
 bool CpuCalcDispersionPmeReciprocalForceKernel::hasInitializedThreads = false;
@@ -136,7 +166,6 @@ static void spreadCharge(float* posq, std::atomic<int64_t>* atomicGrid, int grid
             float charge = epsilonFactor*posq[4*i+3];
             fvec4 zdata0to3(data[0][2], data[1][2], data[2][2], data[3][2]);
             float zdata4 = data[4][2];
-            float adds[4];
             if (gridIndexZ+4 < gridz) {
                 for (int ix = 0; ix < PME_ORDER; ix++) {
                     int xbase = gridIndexX+ix;
@@ -148,12 +177,8 @@ static void spreadCharge(float* posq, std::atomic<int64_t>* atomicGrid, int grid
                         ybase -= (ybase >= gridy ? gridy : 0);
                         ybase = xbase + ybase*gridz;
                         float multiplier = xdata*data[iy][1];
-                        (zdata0to3*multiplier).store(adds);
-                        atomicSpreadAdd(atomicGrid, ybase+gridIndexZ+0, adds[0]);
-                        atomicSpreadAdd(atomicGrid, ybase+gridIndexZ+1, adds[1]);
-                        atomicSpreadAdd(atomicGrid, ybase+gridIndexZ+2, adds[2]);
-                        atomicSpreadAdd(atomicGrid, ybase+gridIndexZ+3, adds[3]);
-                        atomicSpreadAdd(atomicGrid, ybase+zindex[4], multiplier*zdata4);
+                        atomicSpreadAdd4(atomicGrid, ybase+gridIndexZ, zdata0to3*multiplier);
+                        atomicSpreadAdd1(atomicGrid, ybase+zindex[4], multiplier*zdata4);
                     }
                 }
             }
@@ -168,12 +193,9 @@ static void spreadCharge(float* posq, std::atomic<int64_t>* atomicGrid, int grid
                         ybase -= (ybase >= gridy ? gridy : 0);
                         ybase = xbase + ybase*gridz;
                         float multiplier = xdata*data[iy][1];
-                        (zdata0to3*multiplier).store(adds);
-                        atomicSpreadAdd(atomicGrid, ybase+zindex[0], adds[0]);
-                        atomicSpreadAdd(atomicGrid, ybase+zindex[1], adds[1]);
-                        atomicSpreadAdd(atomicGrid, ybase+zindex[2], adds[2]);
-                        atomicSpreadAdd(atomicGrid, ybase+zindex[3], adds[3]);
-                        atomicSpreadAdd(atomicGrid, ybase+zindex[4], multiplier*zdata4);
+                        int scatterIdx[4] = {ybase+zindex[0], ybase+zindex[1], ybase+zindex[2], ybase+zindex[3]};
+                        atomicSpreadAddScatter4(atomicGrid, scatterIdx, zdata0to3*multiplier);
+                        atomicSpreadAdd1(atomicGrid, ybase+zindex[4], multiplier*zdata4);
                     }
                 }
             }
@@ -730,11 +752,24 @@ void CpuCalcPmeReciprocalForceKernel::runWorkerThread(ThreadPool& threads, int i
     spreadCharge(posq, atomicGrid.get(), gridx, gridy, gridz, numParticles, periodicBoxVectors, recipBoxVectors, atomicCounter, epsilonFactor, index, numThreads, deterministic);
     threads.syncThreads();
     // Convert int64 fixed-point grid to float (replaces per-thread reduction).
+    // Manual 4x unroll exposes ILP so independent int64->double->float chains
+    // can issue in parallel instead of serializing through one load+convert.
     const double invScale = 1.0 / (double)PME_FIXED_POINT_SCALE;
     int finalizeEnd = std::min((int)atomicGridSize, gridEnd);
-    for (int i = gridStart; i < finalizeEnd; i++) {
-        int64_t v = atomicGrid[i].load(std::memory_order_relaxed);
-        realGrid[i] = (float)((double)v * invScale);
+    int fi = gridStart;
+    for (; fi + 4 <= finalizeEnd; fi += 4) {
+        int64_t v0 = atomicGrid[fi+0].load(std::memory_order_relaxed);
+        int64_t v1 = atomicGrid[fi+1].load(std::memory_order_relaxed);
+        int64_t v2 = atomicGrid[fi+2].load(std::memory_order_relaxed);
+        int64_t v3 = atomicGrid[fi+3].load(std::memory_order_relaxed);
+        realGrid[fi+0] = (float)((double)v0 * invScale);
+        realGrid[fi+1] = (float)((double)v1 * invScale);
+        realGrid[fi+2] = (float)((double)v2 * invScale);
+        realGrid[fi+3] = (float)((double)v3 * invScale);
+    }
+    for (; fi < finalizeEnd; fi++) {
+        int64_t v = atomicGrid[fi].load(std::memory_order_relaxed);
+        realGrid[fi] = (float)((double)v * invScale);
     }
     threads.syncThreads();
     if (lastBoxVectors[0] != periodicBoxVectors[0] || lastBoxVectors[1] != periodicBoxVectors[1] || lastBoxVectors[2] != periodicBoxVectors[2]) {
@@ -1029,9 +1064,20 @@ void CpuCalcDispersionPmeReciprocalForceKernel::runWorkerThread(ThreadPool& thre
     threads.syncThreads();
     const double invScale = 1.0 / (double)PME_FIXED_POINT_SCALE;
     int finalizeEnd = std::min((int)atomicGridSize, gridEnd);
-    for (int i = gridStart; i < finalizeEnd; i++) {
-        int64_t v = atomicGrid[i].load(std::memory_order_relaxed);
-        realGrid[i] = (float)((double)v * invScale);
+    int fi = gridStart;
+    for (; fi + 4 <= finalizeEnd; fi += 4) {
+        int64_t v0 = atomicGrid[fi+0].load(std::memory_order_relaxed);
+        int64_t v1 = atomicGrid[fi+1].load(std::memory_order_relaxed);
+        int64_t v2 = atomicGrid[fi+2].load(std::memory_order_relaxed);
+        int64_t v3 = atomicGrid[fi+3].load(std::memory_order_relaxed);
+        realGrid[fi+0] = (float)((double)v0 * invScale);
+        realGrid[fi+1] = (float)((double)v1 * invScale);
+        realGrid[fi+2] = (float)((double)v2 * invScale);
+        realGrid[fi+3] = (float)((double)v3 * invScale);
+    }
+    for (; fi < finalizeEnd; fi++) {
+        int64_t v = atomicGrid[fi].load(std::memory_order_relaxed);
+        realGrid[fi] = (float)((double)v * invScale);
     }
     threads.syncThreads();
     if (lastBoxVectors[0] != periodicBoxVectors[0] || lastBoxVectors[1] != periodicBoxVectors[1] || lastBoxVectors[2] != periodicBoxVectors[2]) {
