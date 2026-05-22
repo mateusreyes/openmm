@@ -58,16 +58,43 @@ static const int PME_ORDER = 5;
 // Determinism is NOT preserved: float addition is not associative, and the
 // order in which threads' contributions land at a given cell can vary between
 // runs. Use this variant only when DeterministicForces is not required.
-static inline void atomicSpreadAdd(std::atomic<float>* grid, int idx, float value) {
+static inline void atomicSpreadAdd1(std::atomic<float>* grid, int idx, float value) {
     if (value == 0.0f)
         return;
     float old = grid[idx].load(std::memory_order_relaxed);
     float desired;
-    do {
+    while (true) {
         desired = old + value;
-    } while (!grid[idx].compare_exchange_weak(old, desired,
-                                              std::memory_order_relaxed,
-                                              std::memory_order_relaxed));
+        if (grid[idx].compare_exchange_weak(old, desired,
+                                            std::memory_order_relaxed,
+                                            std::memory_order_relaxed))
+            return;
+        _mm_pause();
+    }
+}
+
+static inline void atomicSpreadAdd4(std::atomic<float>* grid, int base, fvec4 adds4) {
+    int mask = _mm_movemask_ps((adds4 != fvec4(0.0f)).val);
+    if (mask == 0)
+        return;
+    float v[4];
+    adds4.store(v);
+    if (mask & 1) atomicSpreadAdd1(grid, base+0, v[0]);
+    if (mask & 2) atomicSpreadAdd1(grid, base+1, v[1]);
+    if (mask & 4) atomicSpreadAdd1(grid, base+2, v[2]);
+    if (mask & 8) atomicSpreadAdd1(grid, base+3, v[3]);
+}
+
+static inline void atomicSpreadAddScatter4(std::atomic<float>* grid, const int* idx, fvec4 adds4) {
+    int mask = _mm_movemask_ps((adds4 != fvec4(0.0f)).val);
+    if (mask == 0)
+        return;
+    float v[4];
+    adds4.store(v);
+    if (mask & 1) atomicSpreadAdd1(grid, idx[0], v[0]);
+    if (mask & 2) atomicSpreadAdd1(grid, idx[1], v[1]);
+    if (mask & 4) atomicSpreadAdd1(grid, idx[2], v[2]);
+    if (mask & 8) atomicSpreadAdd1(grid, idx[3], v[3]);
 }
 
 bool CpuCalcDispersionPmeReciprocalForceKernel::hasInitializedThreads = false;
@@ -141,7 +168,6 @@ static void spreadCharge(float* posq, std::atomic<float>* atomicGrid, int gridx,
             float charge = epsilonFactor*posq[4*i+3];
             fvec4 zdata0to3(data[0][2], data[1][2], data[2][2], data[3][2]);
             float zdata4 = data[4][2];
-            float adds[4];
             if (gridIndexZ+4 < gridz) {
                 for (int ix = 0; ix < PME_ORDER; ix++) {
                     int xbase = gridIndexX+ix;
@@ -153,12 +179,8 @@ static void spreadCharge(float* posq, std::atomic<float>* atomicGrid, int gridx,
                         ybase -= (ybase >= gridy ? gridy : 0);
                         ybase = xbase + ybase*gridz;
                         float multiplier = xdata*data[iy][1];
-                        (zdata0to3*multiplier).store(adds);
-                        atomicSpreadAdd(atomicGrid, ybase+gridIndexZ+0, adds[0]);
-                        atomicSpreadAdd(atomicGrid, ybase+gridIndexZ+1, adds[1]);
-                        atomicSpreadAdd(atomicGrid, ybase+gridIndexZ+2, adds[2]);
-                        atomicSpreadAdd(atomicGrid, ybase+gridIndexZ+3, adds[3]);
-                        atomicSpreadAdd(atomicGrid, ybase+zindex[4], multiplier*zdata4);
+                        atomicSpreadAdd4(atomicGrid, ybase+gridIndexZ, zdata0to3*multiplier);
+                        atomicSpreadAdd1(atomicGrid, ybase+zindex[4], multiplier*zdata4);
                     }
                 }
             }
@@ -173,12 +195,9 @@ static void spreadCharge(float* posq, std::atomic<float>* atomicGrid, int gridx,
                         ybase -= (ybase >= gridy ? gridy : 0);
                         ybase = xbase + ybase*gridz;
                         float multiplier = xdata*data[iy][1];
-                        (zdata0to3*multiplier).store(adds);
-                        atomicSpreadAdd(atomicGrid, ybase+zindex[0], adds[0]);
-                        atomicSpreadAdd(atomicGrid, ybase+zindex[1], adds[1]);
-                        atomicSpreadAdd(atomicGrid, ybase+zindex[2], adds[2]);
-                        atomicSpreadAdd(atomicGrid, ybase+zindex[3], adds[3]);
-                        atomicSpreadAdd(atomicGrid, ybase+zindex[4], multiplier*zdata4);
+                        int scatterIdx[4] = {ybase+zindex[0], ybase+zindex[1], ybase+zindex[2], ybase+zindex[3]};
+                        atomicSpreadAddScatter4(atomicGrid, scatterIdx, zdata0to3*multiplier);
+                        atomicSpreadAdd1(atomicGrid, ybase+zindex[4], multiplier*zdata4);
                     }
                 }
             }
