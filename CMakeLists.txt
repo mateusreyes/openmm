@@ -94,7 +94,7 @@ IF(X86 OR ARM)
     SET(OPENMM_SOURCE_SUBDIRS ${OPENMM_SOURCE_SUBDIRS} libraries/vecmath)
 ENDIF()
 
-SET (CMAKE_CXX_STANDARD 11)
+SET (CMAKE_CXX_STANDARD 20)
 
 IF(APPLE)
     # Build 64 bit binaries compatible with OS X 10.7

@@ -43,9 +43,12 @@
 #include "pocketfft_hdronly.h"
 #include <cmath>
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
+#include <memory>
 #include <sstream>
 #include <cstdlib>
+#include <string>
 
 using namespace OpenMM;
 using namespace std;
@@ -55,7 +58,111 @@ static const int PME_ORDER = 5;
 bool CpuCalcDispersionPmeReciprocalForceKernel::hasInitializedThreads = false;
 int CpuCalcDispersionPmeReciprocalForceKernel::numThreads = 0;
 
-static void spreadCharge(float* posq, vector<float>& grid, int gridx, int gridy, int gridz, int numParticles, Vec3* periodicBoxVectors, Vec3* recipBoxVectors,
+// Read the OPENMM_CPU_PME_SPREAD_VARIANT environment variable and return the
+// matching enum value. Throws OpenMMException on an unknown string. Empty or
+// unset means PerThread (the historical behaviour).
+static CpuPmeSpreadVariant parseSpreadVariantEnv() {
+    const char* env = std::getenv("OPENMM_CPU_PME_SPREAD_VARIANT");
+    if (env == NULL || env[0] == '\0')
+        return CpuPmeSpreadVariant::PerThread;
+    std::string v = env;
+    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return std::tolower(c); });
+    if (v == "per_thread" || v == "perthread")
+        return CpuPmeSpreadVariant::PerThread;
+    if (v == "bitset")
+        return CpuPmeSpreadVariant::Bitset;
+    if (v == "atomic_float" || v == "atomicfloat" || v == "atomic")
+        return CpuPmeSpreadVariant::AtomicFloat;
+    throw OpenMMException("OPENMM_CPU_PME_SPREAD_VARIANT must be one of: per_thread, bitset, atomic_float (got \"" + std::string(env) + "\")");
+}
+
+// ---------------------------------------------------------------------------
+// Scatter helpers used by the Bitset variant.
+// ---------------------------------------------------------------------------
+
+// Size (in bytes) of the per-thread "touched" bitmap companion to each PME
+// grid. One bit per grid cell; +1 byte of padding so the 16-bit read in
+// scatter_add4 cannot overrun.
+static inline std::size_t touchedBitmapSize(int gridx, int gridy, int gridz) {
+    return ((std::size_t)gridx*gridy*gridz + 7) / 8 + 1;
+}
+
+// Scatter-add a 4-lane SIMD vector into grid at consecutive index idx,
+// treating cells whose bit is unset as logical zero.
+static inline void scatter_add4(float* grid, std::uint8_t* touched, int idx, fvec4 add) {
+    int byte = idx >> 3;
+    int shift = idx & 7;
+    std::uint32_t b0 = touched[byte];
+    std::uint32_t b1 = touched[byte+1];
+    std::uint32_t bits = ((b0 | (b1 << 8)) >> shift) & 0xF;
+    fvec4 mask = fvec4::expandBitsToMask((int)bits);
+    fvec4 g(&grid[idx]);
+    ((g & mask) + add).store(&grid[idx]);
+    std::uint32_t set = (std::uint32_t)0xF << shift;
+    touched[byte]   = (std::uint8_t)(b0 | (set & 0xFF));
+    touched[byte+1] = (std::uint8_t)(b1 | ((set >> 8) & 0xFF));
+}
+
+// Scatter-add a scalar into grid at idx. First write to a cell overwrites
+// its stale value; subsequent writes accumulate.
+static inline void scatter_add1(float* grid, std::uint8_t* touched, int idx, float add) {
+    int byte = idx >> 3;
+    int shift = idx & 7;
+    std::uint8_t bit = (std::uint8_t)(1 << shift);
+    std::uint8_t cur = touched[byte];
+    if (cur & bit) {
+        grid[idx] += add;
+    } else {
+        grid[idx] = add;
+        touched[byte] = (std::uint8_t)(cur | bit);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Atomic helpers used by the AtomicFloat variant. std::atomic<float>::fetch_add
+// is a C++20 addition; CMAKE_CXX_STANDARD is set to 20 for this reason.
+// Determinism is NOT preserved - float addition is not associative.
+// ---------------------------------------------------------------------------
+
+static inline void atomicSpreadAdd1(std::atomic<float>* grid, int idx, float value) {
+    if (value == 0.0f)
+        return;
+    grid[idx].fetch_add(value, std::memory_order_relaxed);
+}
+
+static inline void atomicSpreadAdd4(std::atomic<float>* grid, int base, fvec4 adds4) {
+    int mask = _mm_movemask_ps((adds4 != fvec4(0.0f)).val);
+    if (mask == 0)
+        return;
+    float v[4];
+    adds4.store(v);
+    if (mask & 1) atomicSpreadAdd1(grid, base+0, v[0]);
+    if (mask & 2) atomicSpreadAdd1(grid, base+1, v[1]);
+    if (mask & 4) atomicSpreadAdd1(grid, base+2, v[2]);
+    if (mask & 8) atomicSpreadAdd1(grid, base+3, v[3]);
+}
+
+static inline void atomicSpreadAddScatter4(std::atomic<float>* grid, const int* idx, fvec4 adds4) {
+    int mask = _mm_movemask_ps((adds4 != fvec4(0.0f)).val);
+    if (mask == 0)
+        return;
+    float v[4];
+    adds4.store(v);
+    if (mask & 1) atomicSpreadAdd1(grid, idx[0], v[0]);
+    if (mask & 2) atomicSpreadAdd1(grid, idx[1], v[1]);
+    if (mask & 4) atomicSpreadAdd1(grid, idx[2], v[2]);
+    if (mask & 8) atomicSpreadAdd1(grid, idx[3], v[3]);
+}
+
+// ---------------------------------------------------------------------------
+// Three spreadCharge variants. They share an identical outer/B-spline loop;
+// the inner scatter is what differs (the per-thread, bitset, and atomic
+// shared-grid storage models can't share a function signature).
+// ---------------------------------------------------------------------------
+
+// Variant 1: per-thread vector<float> grid, full memset each step, reduction
+// later. This is the historical OpenMM behaviour - deterministic, well-tested.
+static void spreadChargePerThread(float* posq, vector<float>& grid, int gridx, int gridy, int gridz, int numParticles, Vec3* periodicBoxVectors, Vec3* recipBoxVectors,
         atomic<int>& atomicCounter, const float epsilonFactor, int threadIndex, int numThreads, bool deterministic) {
     float temp[4];
     fvec4 boxSize((float) periodicBoxVectors[0][0], (float) periodicBoxVectors[1][1], (float) periodicBoxVectors[2][2], 0);
@@ -81,8 +188,6 @@ static void spreadCharge(float* posq, vector<float>& grid, int gridx, int gridy,
 
         int end = min(start + groupSize, numParticles);
         for (int i = start; i < end; ++i) {
-            // Find the position relative to the nearest grid point.
-
             fvec4 pos(&posq[4*i]);
             (pos-boxSize*floor(pos*invBoxSize)).store(posInBox);
             fvec4 t = posInBox[0]*recipBoxVec0 + posInBox[1]*recipBoxVec1 + posInBox[2]*recipBoxVec2;
@@ -90,8 +195,6 @@ static void spreadCharge(float* posq, vector<float>& grid, int gridx, int gridy,
             ivec4 ti = t;
             fvec4 dr = t-ti;
             ivec4 gridIndex = ti-(gridSizeInt&ti==gridSizeInt);
-
-            // Compute the B-spline coefficients.
 
             fvec4 data[PME_ORDER];
             data[PME_ORDER-1] = 0.0f;
@@ -109,13 +212,11 @@ static void spreadCharge(float* posq, vector<float>& grid, int gridx, int gridy,
                 data[PME_ORDER-j-1] = scale*((dr+j)*data[PME_ORDER-j-2]+(fvec4(PME_ORDER-j)-dr)*data[PME_ORDER-j-1]);
             data[0] = scale*(one-dr)*data[0];
 
-            // Spread the charges.
-
             int gridIndexX = gridIndex[0];
             int gridIndexY = gridIndex[1];
             int gridIndexZ = gridIndex[2];
             if (gridIndexX < 0)
-                return; // This happens when a simulation blows up and coordinates become NaN.
+                return; // NaN coords on simulation blow-up.
             int zindex[PME_ORDER];
             for (int j = 0; j < PME_ORDER; j++) {
                 zindex[j] = gridIndexZ+j;
@@ -159,6 +260,223 @@ static void spreadCharge(float* posq, vector<float>& grid, int gridx, int gridy,
                         grid[ybase+zindex[2]] += temp[2];
                         grid[ybase+zindex[3]] += temp[3];
                         grid[ybase+zindex[4]] += multiplier*zdata4;
+                    }
+                }
+            }
+        }
+
+        if (deterministic)
+            start += groupSize * numThreads;
+    }
+}
+
+// Variant 2: per-thread grid + touched-cell bitmap. Skips the per-step memset
+// on untouched cells. Helps memset-dominated workloads (large grids,
+// many threads). Deterministic.
+static void spreadChargeBitset(float* posq, vector<float>& grid, vector<std::uint8_t>& touched, int gridx, int gridy, int gridz, int numParticles, Vec3* periodicBoxVectors, Vec3* recipBoxVectors,
+        atomic<int>& atomicCounter, const float epsilonFactor, int threadIndex, int numThreads, bool deterministic) {
+    float temp[4];
+    fvec4 boxSize((float) periodicBoxVectors[0][0], (float) periodicBoxVectors[1][1], (float) periodicBoxVectors[2][2], 0);
+    fvec4 invBoxSize((float) recipBoxVectors[0][0], (float) recipBoxVectors[1][1], (float) recipBoxVectors[2][2], 0);
+    fvec4 recipBoxVec0((float) recipBoxVectors[0][0], (float) recipBoxVectors[0][1], (float) recipBoxVectors[0][2], 0);
+    fvec4 recipBoxVec1((float) recipBoxVectors[1][0], (float) recipBoxVectors[1][1], (float) recipBoxVectors[1][2], 0);
+    fvec4 recipBoxVec2((float) recipBoxVectors[2][0], (float) recipBoxVectors[2][1], (float) recipBoxVectors[2][2], 0);
+    fvec4 gridSize(gridx, gridy, gridz, 0);
+    ivec4 gridSizeInt(gridx, gridy, gridz, 0);
+    fvec4 one(1);
+    fvec4 scale(1.0f/(PME_ORDER-1));
+    float posInBox[4] = {0,0,0,0};
+    float* gridPtr = grid.data();
+    std::uint8_t* touchedPtr = touched.data();
+    memset(touchedPtr, 0, touched.size());
+
+    const int groupSize = max(1, numParticles / (10 * numThreads));
+    int start = groupSize * threadIndex;
+    while (true) {
+        if (!deterministic)
+            start = atomicCounter.fetch_add(groupSize);
+
+        if (start >= numParticles)
+            break;
+
+        int end = min(start + groupSize, numParticles);
+        for (int i = start; i < end; ++i) {
+            fvec4 pos(&posq[4*i]);
+            (pos-boxSize*floor(pos*invBoxSize)).store(posInBox);
+            fvec4 t = posInBox[0]*recipBoxVec0 + posInBox[1]*recipBoxVec1 + posInBox[2]*recipBoxVec2;
+            t = (t-floor(t))*gridSize;
+            ivec4 ti = t;
+            fvec4 dr = t-ti;
+            ivec4 gridIndex = ti-(gridSizeInt&ti==gridSizeInt);
+
+            fvec4 data[PME_ORDER];
+            data[PME_ORDER-1] = 0.0f;
+            data[1] = dr;
+            data[0] = one-dr;
+            for (int j = 3; j < PME_ORDER; j++) {
+                fvec4 div(1.0f/(j-1));
+                data[j-1] = div*dr*data[j-2];
+                for (int k = 1; k < j-1; k++)
+                    data[j-k-1] = div*((dr+k)*data[j-k-2]+(fvec4(j-k)-dr)*data[j-k-1]);
+                data[0] = div*(one-dr)*data[0];
+            }
+            data[PME_ORDER-1] = scale*dr*data[PME_ORDER-2];
+            for (int j = 1; j < (PME_ORDER-1); j++)
+                data[PME_ORDER-j-1] = scale*((dr+j)*data[PME_ORDER-j-2]+(fvec4(PME_ORDER-j)-dr)*data[PME_ORDER-j-1]);
+            data[0] = scale*(one-dr)*data[0];
+
+            int gridIndexX = gridIndex[0];
+            int gridIndexY = gridIndex[1];
+            int gridIndexZ = gridIndex[2];
+            if (gridIndexX < 0)
+                return;
+            int zindex[PME_ORDER];
+            for (int j = 0; j < PME_ORDER; j++) {
+                zindex[j] = gridIndexZ+j;
+                zindex[j] -= (zindex[j] >= gridz ? gridz : 0);
+            }
+            float charge = epsilonFactor*posq[4*i+3];
+            fvec4 zdata0to3(data[0][2], data[1][2], data[2][2], data[3][2]);
+            float zdata4 = data[4][2];
+            if (gridIndexZ+4 < gridz) {
+                for (int ix = 0; ix < PME_ORDER; ix++) {
+                    int xbase = gridIndexX+ix;
+                    xbase -= (xbase >= gridx ? gridx : 0);
+                    xbase = xbase*gridy*gridz;
+                    float xdata = charge*data[ix][0];
+                    for (int iy = 0; iy < PME_ORDER; iy++) {
+                        int ybase = gridIndexY+iy;
+                        ybase -= (ybase >= gridy ? gridy : 0);
+                        ybase = xbase + ybase*gridz;
+                        float multiplier = xdata*data[iy][1];
+                        fvec4 add0to3 = zdata0to3*multiplier;
+                        scatter_add4(gridPtr, touchedPtr, ybase+gridIndexZ, add0to3);
+                        scatter_add1(gridPtr, touchedPtr, ybase+zindex[4], multiplier*zdata4);
+                    }
+                }
+            }
+            else {
+                for (int ix = 0; ix < PME_ORDER; ix++) {
+                    int xbase = gridIndexX+ix;
+                    xbase -= (xbase >= gridx ? gridx : 0);
+                    xbase = xbase*gridy*gridz;
+                    float xdata = charge*data[ix][0];
+                    for (int iy = 0; iy < PME_ORDER; iy++) {
+                        int ybase = gridIndexY+iy;
+                        ybase -= (ybase >= gridy ? gridy : 0);
+                        ybase = xbase + ybase*gridz;
+                        float multiplier = xdata*data[iy][1];
+                        fvec4 add0to3 = zdata0to3*multiplier;
+                        add0to3.store(temp);
+                        scatter_add1(gridPtr, touchedPtr, ybase+zindex[0], temp[0]);
+                        scatter_add1(gridPtr, touchedPtr, ybase+zindex[1], temp[1]);
+                        scatter_add1(gridPtr, touchedPtr, ybase+zindex[2], temp[2]);
+                        scatter_add1(gridPtr, touchedPtr, ybase+zindex[3], temp[3]);
+                        scatter_add1(gridPtr, touchedPtr, ybase+zindex[4], multiplier*zdata4);
+                    }
+                }
+            }
+        }
+
+        if (deterministic)
+            start += groupSize * numThreads;
+    }
+}
+
+// Variant 3: single shared atomic<float> grid, C++20 fetch_add. Wins at high
+// core count + large grid. NOT deterministic.
+static void spreadChargeAtomicFloat(float* posq, std::atomic<float>* atomicGrid, int gridx, int gridy, int gridz, int numParticles, Vec3* periodicBoxVectors, Vec3* recipBoxVectors,
+        atomic<int>& atomicCounter, const float epsilonFactor, int threadIndex, int numThreads, bool deterministic) {
+    fvec4 boxSize((float) periodicBoxVectors[0][0], (float) periodicBoxVectors[1][1], (float) periodicBoxVectors[2][2], 0);
+    fvec4 invBoxSize((float) recipBoxVectors[0][0], (float) recipBoxVectors[1][1], (float) recipBoxVectors[2][2], 0);
+    fvec4 recipBoxVec0((float) recipBoxVectors[0][0], (float) recipBoxVectors[0][1], (float) recipBoxVectors[0][2], 0);
+    fvec4 recipBoxVec1((float) recipBoxVectors[1][0], (float) recipBoxVectors[1][1], (float) recipBoxVectors[1][2], 0);
+    fvec4 recipBoxVec2((float) recipBoxVectors[2][0], (float) recipBoxVectors[2][1], (float) recipBoxVectors[2][2], 0);
+    fvec4 gridSize(gridx, gridy, gridz, 0);
+    ivec4 gridSizeInt(gridx, gridy, gridz, 0);
+    fvec4 one(1);
+    fvec4 scale(1.0f/(PME_ORDER-1));
+    float posInBox[4] = {0,0,0,0};
+    // Grid is pre-zeroed in parallel by runWorkerThread before this is called.
+
+    const int groupSize = max(1, numParticles / (10 * numThreads));
+    int start = groupSize * threadIndex;
+    while (true) {
+        if (!deterministic)
+            start = atomicCounter.fetch_add(groupSize);
+
+        if (start >= numParticles)
+            break;
+
+        int end = min(start + groupSize, numParticles);
+        for (int i = start; i < end; ++i) {
+            fvec4 pos(&posq[4*i]);
+            (pos-boxSize*floor(pos*invBoxSize)).store(posInBox);
+            fvec4 t = posInBox[0]*recipBoxVec0 + posInBox[1]*recipBoxVec1 + posInBox[2]*recipBoxVec2;
+            t = (t-floor(t))*gridSize;
+            ivec4 ti = t;
+            fvec4 dr = t-ti;
+            ivec4 gridIndex = ti-(gridSizeInt&ti==gridSizeInt);
+
+            fvec4 data[PME_ORDER];
+            data[PME_ORDER-1] = 0.0f;
+            data[1] = dr;
+            data[0] = one-dr;
+            for (int j = 3; j < PME_ORDER; j++) {
+                fvec4 div(1.0f/(j-1));
+                data[j-1] = div*dr*data[j-2];
+                for (int k = 1; k < j-1; k++)
+                    data[j-k-1] = div*((dr+k)*data[j-k-2]+(fvec4(j-k)-dr)*data[j-k-1]);
+                data[0] = div*(one-dr)*data[0];
+            }
+            data[PME_ORDER-1] = scale*dr*data[PME_ORDER-2];
+            for (int j = 1; j < (PME_ORDER-1); j++)
+                data[PME_ORDER-j-1] = scale*((dr+j)*data[PME_ORDER-j-2]+(fvec4(PME_ORDER-j)-dr)*data[PME_ORDER-j-1]);
+            data[0] = scale*(one-dr)*data[0];
+
+            int gridIndexX = gridIndex[0];
+            int gridIndexY = gridIndex[1];
+            int gridIndexZ = gridIndex[2];
+            if (gridIndexX < 0)
+                return;
+            int zindex[PME_ORDER];
+            for (int j = 0; j < PME_ORDER; j++) {
+                zindex[j] = gridIndexZ+j;
+                zindex[j] -= (zindex[j] >= gridz ? gridz : 0);
+            }
+            float charge = epsilonFactor*posq[4*i+3];
+            fvec4 zdata0to3(data[0][2], data[1][2], data[2][2], data[3][2]);
+            float zdata4 = data[4][2];
+            if (gridIndexZ+4 < gridz) {
+                for (int ix = 0; ix < PME_ORDER; ix++) {
+                    int xbase = gridIndexX+ix;
+                    xbase -= (xbase >= gridx ? gridx : 0);
+                    xbase = xbase*gridy*gridz;
+                    float xdata = charge*data[ix][0];
+                    for (int iy = 0; iy < PME_ORDER; iy++) {
+                        int ybase = gridIndexY+iy;
+                        ybase -= (ybase >= gridy ? gridy : 0);
+                        ybase = xbase + ybase*gridz;
+                        float multiplier = xdata*data[iy][1];
+                        atomicSpreadAdd4(atomicGrid, ybase+gridIndexZ, zdata0to3*multiplier);
+                        atomicSpreadAdd1(atomicGrid, ybase+zindex[4], multiplier*zdata4);
+                    }
+                }
+            }
+            else {
+                for (int ix = 0; ix < PME_ORDER; ix++) {
+                    int xbase = gridIndexX+ix;
+                    xbase -= (xbase >= gridx ? gridx : 0);
+                    xbase = xbase*gridy*gridz;
+                    float xdata = charge*data[ix][0];
+                    for (int iy = 0; iy < PME_ORDER; iy++) {
+                        int ybase = gridIndexY+iy;
+                        ybase -= (ybase >= gridy ? gridy : 0);
+                        ybase = xbase + ybase*gridz;
+                        float multiplier = xdata*data[iy][1];
+                        int scatterIdx[4] = {ybase+zindex[0], ybase+zindex[1], ybase+zindex[2], ybase+zindex[3]};
+                        atomicSpreadAddScatter4(atomicGrid, scatterIdx, zdata0to3*multiplier);
+                        atomicSpreadAdd1(atomicGrid, ybase+zindex[4], multiplier*zdata4);
                     }
                 }
             }
@@ -559,12 +877,29 @@ void CpuCalcPmeReciprocalForceKernel::initialize(int xsize, int ysize, int zsize
         while (!isFinished)
             endCondition.wait(ul);
     }
-    
-    // Initialize the FFT grids.
 
-    realGrids.resize(numThreads, vector<float>(gridx*gridy*gridz+3));
+    // Pick the spread variant and check for the deterministic/atomic conflict.
+    spreadVariant = parseSpreadVariantEnv();
+    if (spreadVariant == CpuPmeSpreadVariant::AtomicFloat && deterministic)
+        throw OpenMMException("OPENMM_CPU_PME_SPREAD_VARIANT=atomic_float is not compatible with DeterministicForces=true");
+
+    // Initialize the FFT grids. PerThread/Bitset use one grid per worker thread
+    // (reduction at the end); AtomicFloat uses a single shared atomic grid plus
+    // realGrids[0] as the FFT input buffer.
+    if (spreadVariant == CpuPmeSpreadVariant::AtomicFloat) {
+        realGrids.resize(1, vector<float>(gridx*gridy*gridz+3));
+        atomicGridSize = (std::size_t) gridx*gridy*gridz;
+        atomicGrid.reset(new std::atomic<float>[atomicGridSize]);
+        for (std::size_t i = 0; i < atomicGridSize; i++)
+            atomicGrid[i].store(0.0f, std::memory_order_relaxed);
+    }
+    else {
+        realGrids.resize(numThreads, vector<float>(gridx*gridy*gridz+3));
+        if (spreadVariant == CpuPmeSpreadVariant::Bitset)
+            touchedGrids.resize(numThreads, vector<std::uint8_t>(touchedBitmapSize(gridx, gridy, gridz)));
+    }
     complexGrid.resize(gridx*gridy*(gridz/2+1));
-    
+
     // Initialize the b-spline moduli.
 
     int maxSize = std::max(std::max(gridx, gridy), gridz);
@@ -644,9 +979,13 @@ void CpuCalcPmeReciprocalForceKernel::runMainThread() {
             break;
         posq = io->getPosq();
         atomicCounter = 0;
-        threads.execute([&] (ThreadPool& threads, int threadIndex) { runWorkerThread(threads, threadIndex); }); // Signal threads to perform charge spreading.
+        threads.execute([&] (ThreadPool& threads, int threadIndex) { runWorkerThread(threads, threadIndex); }); // Signal threads to perform charge spreading (or, for AtomicFloat, to zero the atomic grid first).
         threads.waitForThreads();
-        threads.resumeThreads(); // Signal threads to sum the charge grids.
+        if (spreadVariant == CpuPmeSpreadVariant::AtomicFloat) {
+            threads.resumeThreads(); // Signal threads to spread charge into the atomic grid.
+            threads.waitForThreads();
+        }
+        threads.resumeThreads(); // Signal threads to sum the charge grids (or, for AtomicFloat, copy atomic->realGrids[0]).
         threads.waitForThreads();
         pocketfft::r2c(gridShape, realGridStride, complexGridStride, fftAxes, true, realGrids[0].data(), complexGrid.data(), 1.0f, 0);
         if (lastBoxVectors[0] != periodicBoxVectors[0] || lastBoxVectors[1] != periodicBoxVectors[1] || lastBoxVectors[2] != periodicBoxVectors[2]) {
@@ -699,14 +1038,52 @@ void CpuCalcPmeReciprocalForceKernel::runWorkerThread(ThreadPool& threads, int i
     int complexStart = std::max(1, ((index*complexSize)/numThreads));
     int complexEnd = (((index+1)*complexSize)/numThreads);
     const float epsilonFactor = sqrt(ONE_4PI_EPS0);
-    spreadCharge(posq, realGrids[index], gridx, gridy, gridz, numParticles, periodicBoxVectors, recipBoxVectors, atomicCounter, epsilonFactor, index, numThreads, deterministic);
-    threads.syncThreads();
-    int numGrids = realGrids.size();
-    for (int i = gridStart; i < gridEnd; i += 4) {
-        fvec4 sum(&realGrids[0][i]);
-        for (int j = 1; j < numGrids; j++)
-            sum += fvec4(&realGrids[j][i]);
-        sum.store(&realGrids[0][i]);
+    if (spreadVariant == CpuPmeSpreadVariant::AtomicFloat) {
+        // Phase 1: parallel-zero the atomic grid.
+        std::size_t total = atomicGridSize;
+        std::size_t zStart = (std::size_t)(index * (long long)total) / numThreads;
+        std::size_t zEnd = (std::size_t)((index + 1) * (long long)total) / numThreads;
+        for (std::size_t i = zStart; i < zEnd; i++)
+            atomicGrid[i].store(0.0f, std::memory_order_relaxed);
+        threads.syncThreads();
+        // Phase 2: spread into the atomic grid.
+        spreadChargeAtomicFloat(posq, atomicGrid.get(), gridx, gridy, gridz, numParticles, periodicBoxVectors, recipBoxVectors, atomicCounter, epsilonFactor, index, numThreads, deterministic);
+        threads.syncThreads();
+        // Phase 3: copy atomic grid into realGrids[0] for the FFT.
+        int finalizeEnd = std::min((int)atomicGridSize, gridEnd);
+        for (int i = gridStart; i < finalizeEnd; i++)
+            realGrids[0][i] = atomicGrid[i].load(std::memory_order_relaxed);
+    }
+    else if (spreadVariant == CpuPmeSpreadVariant::Bitset) {
+        spreadChargeBitset(posq, realGrids[index], touchedGrids[index], gridx, gridy, gridz, numParticles, periodicBoxVectors, recipBoxVectors, atomicCounter, epsilonFactor, index, numThreads, deterministic);
+        threads.syncThreads();
+        // Reduce per-thread grids into realGrids[0] using the touched bitmaps.
+        // Untouched cells contribute logical zero so stale data never enters the sum.
+        int numGrids = realGrids.size();
+        for (int i = gridStart; i < gridEnd; i += 4) {
+            int byte = i >> 3;
+            int shift = i & 7;
+            fvec4 sum(0.0f);
+            for (int j = 0; j < numGrids; j++) {
+                std::uint32_t bits = ((std::uint32_t)touchedGrids[j][byte] >> shift) & 0xF;
+                if (bits == 0)
+                    continue;
+                fvec4 mask = fvec4::expandBitsToMask((int)bits);
+                sum = sum + (fvec4(&realGrids[j][i]) & mask);
+            }
+            sum.store(&realGrids[0][i]);
+        }
+    }
+    else { // PerThread
+        spreadChargePerThread(posq, realGrids[index], gridx, gridy, gridz, numParticles, periodicBoxVectors, recipBoxVectors, atomicCounter, epsilonFactor, index, numThreads, deterministic);
+        threads.syncThreads();
+        int numGrids = realGrids.size();
+        for (int i = gridStart; i < gridEnd; i += 4) {
+            fvec4 sum(&realGrids[0][i]);
+            for (int j = 1; j < numGrids; j++)
+                sum += fvec4(&realGrids[j][i]);
+            sum.store(&realGrids[0][i]);
+        }
     }
     threads.syncThreads();
     if (lastBoxVectors[0] != periodicBoxVectors[0] || lastBoxVectors[1] != periodicBoxVectors[1] || lastBoxVectors[2] != periodicBoxVectors[2]) {
@@ -861,11 +1238,26 @@ void CpuCalcDispersionPmeReciprocalForceKernel::initialize(int xsize, int ysize,
             endCondition.wait(ul);
     }
 
-    // Initialize the FFT grids.
+    // Pick the spread variant and check for the deterministic/atomic conflict.
+    spreadVariant = parseSpreadVariantEnv();
+    if (spreadVariant == CpuPmeSpreadVariant::AtomicFloat && deterministic)
+        throw OpenMMException("OPENMM_CPU_PME_SPREAD_VARIANT=atomic_float is not compatible with DeterministicForces=true");
 
-    realGrids.resize(numThreads, vector<float>(gridx*gridy*gridz+3));
+    // Initialize the FFT grids; see CpuCalcPmeReciprocalForceKernel::initialize for layout.
+    if (spreadVariant == CpuPmeSpreadVariant::AtomicFloat) {
+        realGrids.resize(1, vector<float>(gridx*gridy*gridz+3));
+        atomicGridSize = (std::size_t) gridx*gridy*gridz;
+        atomicGrid.reset(new std::atomic<float>[atomicGridSize]);
+        for (std::size_t i = 0; i < atomicGridSize; i++)
+            atomicGrid[i].store(0.0f, std::memory_order_relaxed);
+    }
+    else {
+        realGrids.resize(numThreads, vector<float>(gridx*gridy*gridz+3));
+        if (spreadVariant == CpuPmeSpreadVariant::Bitset)
+            touchedGrids.resize(numThreads, vector<std::uint8_t>(touchedBitmapSize(gridx, gridy, gridz)));
+    }
     complexGrid.resize(gridx*gridy*(gridz/2+1));
-    
+
     // Initialize the b-spline moduli.
 
     int maxSize = std::max(std::max(gridx, gridy), gridz);
@@ -946,9 +1338,13 @@ void CpuCalcDispersionPmeReciprocalForceKernel::runMainThread() {
         posq = io->getPosq();
         ComputeTask task(*this);
         atomicCounter = 0;
-        threads.execute(task); // Signal threads to perform charge spreading.
+        threads.execute(task); // Signal threads to perform charge spreading (or, for AtomicFloat, to zero the atomic grid first).
         threads.waitForThreads();
-        threads.resumeThreads(); // Signal threads to sum the charge grids.
+        if (spreadVariant == CpuPmeSpreadVariant::AtomicFloat) {
+            threads.resumeThreads(); // Signal threads to spread charge into the atomic grid.
+            threads.waitForThreads();
+        }
+        threads.resumeThreads(); // Signal threads to sum the charge grids (or, for AtomicFloat, copy atomic->realGrids[0]).
         threads.waitForThreads();
         pocketfft::r2c(gridShape, realGridStride, complexGridStride, fftAxes, true, realGrids[0].data(), complexGrid.data(), 1.0f, 0);
         if (lastBoxVectors[0] != periodicBoxVectors[0] || lastBoxVectors[1] != periodicBoxVectors[1] || lastBoxVectors[2] != periodicBoxVectors[2]) {
@@ -985,14 +1381,47 @@ void CpuCalcDispersionPmeReciprocalForceKernel::runWorkerThread(ThreadPool& thre
     int complexStart = std::max(1, ((index*complexSize)/numThreads));
     int complexEnd = (((index+1)*complexSize)/numThreads);
     const float epsilonFactor = 1.0f;
-    spreadCharge(posq, realGrids[index], gridx, gridy, gridz, numParticles, periodicBoxVectors, recipBoxVectors, atomicCounter, epsilonFactor, index, numThreads, deterministic);
-    threads.syncThreads();
-    int numGrids = realGrids.size();
-    for (int i = gridStart; i < gridEnd; i += 4) {
-        fvec4 sum(&realGrids[0][i]);
-        for (int j = 1; j < numGrids; j++)
-            sum += fvec4(&realGrids[j][i]);
-        sum.store(&realGrids[0][i]);
+    if (spreadVariant == CpuPmeSpreadVariant::AtomicFloat) {
+        std::size_t total = atomicGridSize;
+        std::size_t zStart = (std::size_t)(index * (long long)total) / numThreads;
+        std::size_t zEnd = (std::size_t)((index + 1) * (long long)total) / numThreads;
+        for (std::size_t i = zStart; i < zEnd; i++)
+            atomicGrid[i].store(0.0f, std::memory_order_relaxed);
+        threads.syncThreads();
+        spreadChargeAtomicFloat(posq, atomicGrid.get(), gridx, gridy, gridz, numParticles, periodicBoxVectors, recipBoxVectors, atomicCounter, epsilonFactor, index, numThreads, deterministic);
+        threads.syncThreads();
+        int finalizeEnd = std::min((int)atomicGridSize, gridEnd);
+        for (int i = gridStart; i < finalizeEnd; i++)
+            realGrids[0][i] = atomicGrid[i].load(std::memory_order_relaxed);
+    }
+    else if (spreadVariant == CpuPmeSpreadVariant::Bitset) {
+        spreadChargeBitset(posq, realGrids[index], touchedGrids[index], gridx, gridy, gridz, numParticles, periodicBoxVectors, recipBoxVectors, atomicCounter, epsilonFactor, index, numThreads, deterministic);
+        threads.syncThreads();
+        int numGrids = realGrids.size();
+        for (int i = gridStart; i < gridEnd; i += 4) {
+            int byte = i >> 3;
+            int shift = i & 7;
+            fvec4 sum(0.0f);
+            for (int j = 0; j < numGrids; j++) {
+                std::uint32_t bits = ((std::uint32_t)touchedGrids[j][byte] >> shift) & 0xF;
+                if (bits == 0)
+                    continue;
+                fvec4 mask = fvec4::expandBitsToMask((int)bits);
+                sum = sum + (fvec4(&realGrids[j][i]) & mask);
+            }
+            sum.store(&realGrids[0][i]);
+        }
+    }
+    else { // PerThread
+        spreadChargePerThread(posq, realGrids[index], gridx, gridy, gridz, numParticles, periodicBoxVectors, recipBoxVectors, atomicCounter, epsilonFactor, index, numThreads, deterministic);
+        threads.syncThreads();
+        int numGrids = realGrids.size();
+        for (int i = gridStart; i < gridEnd; i += 4) {
+            fvec4 sum(&realGrids[0][i]);
+            for (int j = 1; j < numGrids; j++)
+                sum += fvec4(&realGrids[j][i]);
+            sum.store(&realGrids[0][i]);
+        }
     }
     threads.syncThreads();
     if (lastBoxVectors[0] != periodicBoxVectors[0] || lastBoxVectors[1] != periodicBoxVectors[1] || lastBoxVectors[2] != periodicBoxVectors[2]) {

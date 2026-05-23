@@ -38,11 +38,27 @@
 #include <atomic>
 #include <complex>
 #include <condition_variable>
+#include <cstdint>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
 
 namespace OpenMM {
+
+/**
+ * Selects which spreadCharge implementation the CPU PME kernels run.
+ * Chosen at kernel initialize() from the OPENMM_CPU_PME_SPREAD_VARIANT
+ * environment variable; default PerThread preserves the historical
+ * per-thread-grid + reduction behaviour.
+ */
+enum class CpuPmeSpreadVariant {
+    PerThread,    // per-thread vector<float> grid, full memset, reduction.
+    Bitset,       // per-thread grid + touched-cell bitmap; skip memset
+                  // on untouched cells.
+    AtomicFloat   // single shared atomic<float> grid, C++20 fetch_add.
+                  // Not deterministic.
+};
 
 /**
  * This is an optimized CPU implementation of CalcPmeReciprocalForceKernel.  It is both
@@ -124,6 +140,10 @@ private:
     Vec3 lastBoxVectors[3];
     std::vector<float> threadEnergy;
     std::vector<std::vector<float> > realGrids;
+    std::vector<std::vector<std::uint8_t> > touchedGrids; // Bitset variant.
+    std::unique_ptr<std::atomic<float>[]> atomicGrid;     // AtomicFloat variant.
+    std::size_t atomicGridSize = 0;
+    CpuPmeSpreadVariant spreadVariant = CpuPmeSpreadVariant::PerThread;
     std::vector<std::complex<float> > complexGrid;
     std::vector<std::size_t> gridShape, fftAxes;
     std::vector<std::ptrdiff_t> realGridStride, complexGridStride;
@@ -218,6 +238,10 @@ private:
     Vec3 lastBoxVectors[3];
     std::vector<float> threadEnergy;
     std::vector<std::vector<float> > realGrids;
+    std::vector<std::vector<std::uint8_t> > touchedGrids; // Bitset variant.
+    std::unique_ptr<std::atomic<float>[]> atomicGrid;     // AtomicFloat variant.
+    std::size_t atomicGridSize = 0;
+    CpuPmeSpreadVariant spreadVariant = CpuPmeSpreadVariant::PerThread;
     std::vector<std::complex<float> > complexGrid;
     std::vector<std::size_t> gridShape, fftAxes;
     std::vector<std::ptrdiff_t> realGridStride, complexGridStride;
