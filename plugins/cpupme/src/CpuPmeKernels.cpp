@@ -52,25 +52,15 @@ using namespace std;
 
 static const int PME_ORDER = 5;
 
-// std::atomic<float>::fetch_add was added in C++20; OpenMM compiles with C++11,
-// so we implement it explicitly as a compare_exchange_weak loop. x86 has no
-// hardware FP atomic-add either way, so this is what fetch_add would compile to.
-// Determinism is NOT preserved: float addition is not associative, and the
-// order in which threads' contributions land at a given cell can vary between
-// runs. Use this variant only when DeterministicForces is not required.
+// std::atomic<float>::fetch_add is a C++20 addition (the project's
+// CMAKE_CXX_STANDARD is set to 20 for this reason). Determinism is NOT
+// preserved: float addition is not associative, and the order in which
+// threads' contributions land at a given cell can vary between runs.
+// Use this variant only when DeterministicForces is not required.
 static inline void atomicSpreadAdd1(std::atomic<float>* grid, int idx, float value) {
     if (value == 0.0f)
         return;
-    float old = grid[idx].load(std::memory_order_relaxed);
-    float desired;
-    while (true) {
-        desired = old + value;
-        if (grid[idx].compare_exchange_weak(old, desired,
-                                            std::memory_order_relaxed,
-                                            std::memory_order_relaxed))
-            return;
-        _mm_pause();
-    }
+    grid[idx].fetch_add(value, std::memory_order_relaxed);
 }
 
 static inline void atomicSpreadAdd4(std::atomic<float>* grid, int base, fvec4 adds4) {
