@@ -52,10 +52,79 @@ using namespace std;
 
 static const int PME_ORDER = 5;
 
+// Cache-line-granularity touched bitmap. One bit per CELLS_PER_LINE cells
+// (= one bit per 64-byte cache line on x86). On first write to a line, the
+// whole line is eagerly zeroed in SIMD and the bit is set; subsequent
+// writes to the line just load+add+store. This makes the per-scatter
+// bookkeeping a single bit check / branch instead of the bit-level
+// shift+mask+update used by the per-cell bitset, and shrinks the bitmap
+// 16x so it fits comfortably in L1.
+static const int CELLS_PER_LINE = 16; // 64 B / sizeof(float)
+
+// Size of the per-thread touched bitmap, in bytes.
+static inline size_t touchedBitmapSize(int gridx, int gridy, int gridz) {
+    size_t numLines = ((size_t)gridx*gridy*gridz + CELLS_PER_LINE - 1) / CELLS_PER_LINE;
+    return (numLines + 7) / 8 + 1;
+}
+
+// Grid storage size, rounded up so that line-aligned zeroing never runs
+// past the end of the buffer. +3 of trailing pad for the existing
+// unaligned fvec4 read pattern.
+static inline size_t paddedGridSize(int gridx, int gridy, int gridz) {
+    size_t total = (size_t)gridx*gridy*gridz;
+    return ((total + CELLS_PER_LINE - 1) / CELLS_PER_LINE) * CELLS_PER_LINE + 3;
+}
+
+// Zero out one 16-cell cache line (4 fvec4 stores).
+static inline void zeroLine(float* grid, int line_base) {
+    fvec4 z(0.0f);
+    z.store(&grid[line_base + 0]);
+    z.store(&grid[line_base + 4]);
+    z.store(&grid[line_base + 8]);
+    z.store(&grid[line_base + 12]);
+}
+
+// Scatter-add a 4-lane SIMD vector into grid at consecutive index idx.
+// The (very common) fast path stays in a single cache line and pays
+// only one branch on the touched bit.
+static inline void scatter_add4(float* grid, uint8_t* touched, int idx, fvec4 add);
+static inline void scatter_add1(float* grid, uint8_t* touched, int idx, float add) {
+    int line = idx / CELLS_PER_LINE;
+    int line_byte = line >> 3;
+    uint8_t bit = (uint8_t)(1 << (line & 7));
+    if (!(touched[line_byte] & bit)) {
+        zeroLine(grid, line * CELLS_PER_LINE);
+        touched[line_byte] = (uint8_t)(touched[line_byte] | bit);
+    }
+    grid[idx] += add;
+}
+static inline void scatter_add4(float* grid, uint8_t* touched, int idx, fvec4 add) {
+    int line = idx / CELLS_PER_LINE;
+    int offset = idx - line * CELLS_PER_LINE;
+    if (offset + 4 <= CELLS_PER_LINE) {
+        // Fast path: all 4 lanes inside one cache line.
+        int line_byte = line >> 3;
+        uint8_t bit = (uint8_t)(1 << (line & 7));
+        if (!(touched[line_byte] & bit)) {
+            zeroLine(grid, line * CELLS_PER_LINE);
+            touched[line_byte] = (uint8_t)(touched[line_byte] | bit);
+        }
+        (fvec4(&grid[idx]) + add).store(&grid[idx]);
+    } else {
+        // Rare: 4 lanes span 2 cache lines. Fall back to scalar.
+        float v[4];
+        add.store(v);
+        scatter_add1(grid, touched, idx + 0, v[0]);
+        scatter_add1(grid, touched, idx + 1, v[1]);
+        scatter_add1(grid, touched, idx + 2, v[2]);
+        scatter_add1(grid, touched, idx + 3, v[3]);
+    }
+}
+
 bool CpuCalcDispersionPmeReciprocalForceKernel::hasInitializedThreads = false;
 int CpuCalcDispersionPmeReciprocalForceKernel::numThreads = 0;
 
-static void spreadCharge(float* posq, vector<float>& grid, int gridx, int gridy, int gridz, int numParticles, Vec3* periodicBoxVectors, Vec3* recipBoxVectors,
+static void spreadCharge(float* posq, vector<float>& grid, vector<uint8_t>& touched, int gridx, int gridy, int gridz, int numParticles, Vec3* periodicBoxVectors, Vec3* recipBoxVectors,
         atomic<int>& atomicCounter, const float epsilonFactor, int threadIndex, int numThreads, bool deterministic) {
     float temp[4];
     fvec4 boxSize((float) periodicBoxVectors[0][0], (float) periodicBoxVectors[1][1], (float) periodicBoxVectors[2][2], 0);
@@ -68,7 +137,12 @@ static void spreadCharge(float* posq, vector<float>& grid, int gridx, int gridy,
     fvec4 one(1);
     fvec4 scale(1.0f/(PME_ORDER-1));
     float posInBox[4] = {0,0,0,0};
-    memset(grid.data(), 0, sizeof(float)*gridx*gridy*gridz);
+    // Clear only the touched-bitmap (32x smaller than the grid). The
+    // grid itself is left holding stale values from the prior step; the
+    // bitmap encodes "logical zero" so scatter reads mask stale data.
+    float* gridPtr = grid.data();
+    uint8_t* touchedPtr = touched.data();
+    memset(touchedPtr, 0, touched.size());
 
     const int groupSize = max(1, numParticles / (10 * numThreads));
     int start = groupSize * threadIndex;
@@ -136,8 +210,8 @@ static void spreadCharge(float* posq, vector<float>& grid, int gridx, int gridy,
                         ybase = xbase + ybase*gridz;
                         float multiplier = xdata*data[iy][1];
                         fvec4 add0to3 = zdata0to3*multiplier;
-                        (fvec4(&grid[ybase+gridIndexZ])+add0to3).store(&grid[ybase+gridIndexZ]);
-                        grid[ybase+zindex[4]] += multiplier*zdata4;
+                        scatter_add4(gridPtr, touchedPtr, ybase+gridIndexZ, add0to3);
+                        scatter_add1(gridPtr, touchedPtr, ybase+zindex[4], multiplier*zdata4);
                     }
                 }
             }
@@ -154,11 +228,11 @@ static void spreadCharge(float* posq, vector<float>& grid, int gridx, int gridy,
                         float multiplier = xdata*data[iy][1];
                         fvec4 add0to3 = zdata0to3*multiplier;
                         add0to3.store(temp);
-                        grid[ybase+zindex[0]] += temp[0];
-                        grid[ybase+zindex[1]] += temp[1];
-                        grid[ybase+zindex[2]] += temp[2];
-                        grid[ybase+zindex[3]] += temp[3];
-                        grid[ybase+zindex[4]] += multiplier*zdata4;
+                        scatter_add1(gridPtr, touchedPtr, ybase+zindex[0], temp[0]);
+                        scatter_add1(gridPtr, touchedPtr, ybase+zindex[1], temp[1]);
+                        scatter_add1(gridPtr, touchedPtr, ybase+zindex[2], temp[2]);
+                        scatter_add1(gridPtr, touchedPtr, ybase+zindex[3], temp[3]);
+                        scatter_add1(gridPtr, touchedPtr, ybase+zindex[4], multiplier*zdata4);
                     }
                 }
             }
@@ -562,7 +636,8 @@ void CpuCalcPmeReciprocalForceKernel::initialize(int xsize, int ysize, int zsize
     
     // Initialize the FFT grids.
 
-    realGrids.resize(numThreads, vector<float>(gridx*gridy*gridz+3));
+    realGrids.resize(numThreads, vector<float>(paddedGridSize(gridx, gridy, gridz)));
+    touchedGrids.resize(numThreads, vector<uint8_t>(touchedBitmapSize(gridx, gridy, gridz)));
     complexGrid.resize(gridx*gridy*(gridz/2+1));
     
     // Initialize the b-spline moduli.
@@ -692,21 +767,36 @@ void CpuCalcPmeReciprocalForceKernel::runMainThread() {
 void CpuCalcPmeReciprocalForceKernel::runWorkerThread(ThreadPool& threads, int index) {
     int gridxStart = (index*gridx)/numThreads;
     int gridxEnd = ((index+1)*gridx)/numThreads;
-    int gridSize = (gridx*gridy*gridz+3)/4;
-    int gridStart = 4*((index*gridSize)/numThreads);
-    int gridEnd = 4*(((index+1)*gridSize)/numThreads);
+    int numLines = (int)(paddedGridSize(gridx, gridy, gridz) - 3) / CELLS_PER_LINE;
+    int lineStart = (index*numLines)/numThreads;
+    int lineEnd = ((index+1)*numLines)/numThreads;
     int complexSize = gridx*gridy*(gridz/2+1);
     int complexStart = std::max(1, ((index*complexSize)/numThreads));
     int complexEnd = (((index+1)*complexSize)/numThreads);
     const float epsilonFactor = sqrt(ONE_4PI_EPS0);
-    spreadCharge(posq, realGrids[index], gridx, gridy, gridz, numParticles, periodicBoxVectors, recipBoxVectors, atomicCounter, epsilonFactor, index, numThreads, deterministic);
+    spreadCharge(posq, realGrids[index], touchedGrids[index], gridx, gridy, gridz, numParticles, periodicBoxVectors, recipBoxVectors, atomicCounter, epsilonFactor, index, numThreads, deterministic);
     threads.syncThreads();
     int numGrids = realGrids.size();
-    for (int i = gridStart; i < gridEnd; i += 4) {
-        fvec4 sum(&realGrids[0][i]);
-        for (int j = 1; j < numGrids; j++)
-            sum += fvec4(&realGrids[j][i]);
-        sum.store(&realGrids[0][i]);
+    // Reduce per-thread grids into realGrids[0] one cache line at a time.
+    // Untouched lines contribute zero (sum stays at 0 before the store),
+    // so stale data from prior steps never enters the FFT input.
+    for (int line = lineStart; line < lineEnd; line++) {
+        int base = line * CELLS_PER_LINE;
+        int byte = line >> 3;
+        uint8_t bit = (uint8_t)(1 << (line & 7));
+        fvec4 s0(0.0f), s1(0.0f), s2(0.0f), s3(0.0f);
+        for (int j = 0; j < numGrids; j++) {
+            if (touchedGrids[j][byte] & bit) {
+                s0 = s0 + fvec4(&realGrids[j][base + 0]);
+                s1 = s1 + fvec4(&realGrids[j][base + 4]);
+                s2 = s2 + fvec4(&realGrids[j][base + 8]);
+                s3 = s3 + fvec4(&realGrids[j][base + 12]);
+            }
+        }
+        s0.store(&realGrids[0][base + 0]);
+        s1.store(&realGrids[0][base + 4]);
+        s2.store(&realGrids[0][base + 8]);
+        s3.store(&realGrids[0][base + 12]);
     }
     threads.syncThreads();
     if (lastBoxVectors[0] != periodicBoxVectors[0] || lastBoxVectors[1] != periodicBoxVectors[1] || lastBoxVectors[2] != periodicBoxVectors[2]) {
@@ -863,7 +953,8 @@ void CpuCalcDispersionPmeReciprocalForceKernel::initialize(int xsize, int ysize,
 
     // Initialize the FFT grids.
 
-    realGrids.resize(numThreads, vector<float>(gridx*gridy*gridz+3));
+    realGrids.resize(numThreads, vector<float>(paddedGridSize(gridx, gridy, gridz)));
+    touchedGrids.resize(numThreads, vector<uint8_t>(touchedBitmapSize(gridx, gridy, gridz)));
     complexGrid.resize(gridx*gridy*(gridz/2+1));
     
     // Initialize the b-spline moduli.
@@ -978,21 +1069,35 @@ void CpuCalcDispersionPmeReciprocalForceKernel::runMainThread() {
 void CpuCalcDispersionPmeReciprocalForceKernel::runWorkerThread(ThreadPool& threads, int index) {
     int gridxStart = (index*gridx)/numThreads;
     int gridxEnd = ((index+1)*gridx)/numThreads;
-    int gridSize = (gridx*gridy*gridz+3)/4;
-    int gridStart = 4*((index*gridSize)/numThreads);
-    int gridEnd = 4*(((index+1)*gridSize)/numThreads);
+    int numLines = (int)(paddedGridSize(gridx, gridy, gridz) - 3) / CELLS_PER_LINE;
+    int lineStart = (index*numLines)/numThreads;
+    int lineEnd = ((index+1)*numLines)/numThreads;
     int complexSize = gridx*gridy*(gridz/2+1);
     int complexStart = std::max(1, ((index*complexSize)/numThreads));
     int complexEnd = (((index+1)*complexSize)/numThreads);
     const float epsilonFactor = 1.0f;
-    spreadCharge(posq, realGrids[index], gridx, gridy, gridz, numParticles, periodicBoxVectors, recipBoxVectors, atomicCounter, epsilonFactor, index, numThreads, deterministic);
+    spreadCharge(posq, realGrids[index], touchedGrids[index], gridx, gridy, gridz, numParticles, periodicBoxVectors, recipBoxVectors, atomicCounter, epsilonFactor, index, numThreads, deterministic);
     threads.syncThreads();
     int numGrids = realGrids.size();
-    for (int i = gridStart; i < gridEnd; i += 4) {
-        fvec4 sum(&realGrids[0][i]);
-        for (int j = 1; j < numGrids; j++)
-            sum += fvec4(&realGrids[j][i]);
-        sum.store(&realGrids[0][i]);
+    // Reduce per-thread grids into realGrids[0] one cache line at a time;
+    // see CpuCalcPmeReciprocalForceKernel::runWorkerThread for details.
+    for (int line = lineStart; line < lineEnd; line++) {
+        int base = line * CELLS_PER_LINE;
+        int byte = line >> 3;
+        uint8_t bit = (uint8_t)(1 << (line & 7));
+        fvec4 s0(0.0f), s1(0.0f), s2(0.0f), s3(0.0f);
+        for (int j = 0; j < numGrids; j++) {
+            if (touchedGrids[j][byte] & bit) {
+                s0 = s0 + fvec4(&realGrids[j][base + 0]);
+                s1 = s1 + fvec4(&realGrids[j][base + 4]);
+                s2 = s2 + fvec4(&realGrids[j][base + 8]);
+                s3 = s3 + fvec4(&realGrids[j][base + 12]);
+            }
+        }
+        s0.store(&realGrids[0][base + 0]);
+        s1.store(&realGrids[0][base + 4]);
+        s2.store(&realGrids[0][base + 8]);
+        s3.store(&realGrids[0][base + 12]);
     }
     threads.syncThreads();
     if (lastBoxVectors[0] != periodicBoxVectors[0] || lastBoxVectors[1] != periodicBoxVectors[1] || lastBoxVectors[2] != periodicBoxVectors[2]) {
