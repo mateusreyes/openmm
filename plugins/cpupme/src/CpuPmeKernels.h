@@ -123,7 +123,14 @@ private:
     std::vector<float> recipEterm;
     Vec3 lastBoxVectors[3];
     std::vector<float> threadEnergy;
-    std::vector<std::vector<float> > realGrids;
+    // X-slab partitioned grid: a single shared real grid (sized gridx*gridy*gridz+3).
+    // Each thread owns a contiguous X-range and writes to a disjoint X-slice, so no
+    // per-thread duplicate grids or reduction step are needed.
+    std::vector<float> sharedGrid;
+    // Per-thread particle index lists. threadParticles[t] holds the indices of all
+    // particles whose B-spline X-stencil overlaps thread t's X-range. Built once
+    // per step by thread 0 in runWorkerThread.
+    std::vector<std::vector<int> > threadParticles;
     std::vector<std::complex<float> > complexGrid;
     std::vector<std::size_t> gridShape, fftAxes;
     std::vector<std::ptrdiff_t> realGridStride, complexGridStride;
@@ -217,7 +224,9 @@ private:
     std::vector<float> recipEterm;
     Vec3 lastBoxVectors[3];
     std::vector<float> threadEnergy;
-    std::vector<std::vector<float> > realGrids;
+    // X-slab partitioned grid (see comment in CpuCalcPmeReciprocalForceKernel above).
+    std::vector<float> sharedGrid;
+    std::vector<std::vector<int> > threadParticles;
     std::vector<std::complex<float> > complexGrid;
     std::vector<std::size_t> gridShape, fftAxes;
     std::vector<std::ptrdiff_t> realGridStride, complexGridStride;
