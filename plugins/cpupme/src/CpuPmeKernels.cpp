@@ -55,8 +55,43 @@ static const int PME_ORDER = 5;
 bool CpuCalcDispersionPmeReciprocalForceKernel::hasInitializedThreads = false;
 int CpuCalcDispersionPmeReciprocalForceKernel::numThreads = 0;
 
+// Bucket-sort particle indices by X-bin so the spread loop visits particles in
+// spatial order. Improves cache locality of grid writes (consecutive particles
+// touch nearby grid cells). Called once per step by thread 0 only.
+static void buildSortedIndices(const float* posq, int numParticles, int gridx,
+                               const Vec3* periodicBoxVectors,
+                               const Vec3* recipBoxVectors,
+                               std::vector<int>& sortedIndices) {
+    sortedIndices.resize(numParticles);
+    if (numParticles == 0) return;
+    // Compute X-bin per particle.
+    float invBoxX = (float)recipBoxVectors[0][0];
+    float boxX = (float)periodicBoxVectors[0][0];
+    std::vector<int> binOf(numParticles);
+    std::vector<int> binCount(gridx, 0);
+    for (int i = 0; i < numParticles; i++) {
+        float x = posq[4*i];
+        x -= boxX * std::floor(x * invBoxX);  // wrap to [0, boxX)
+        int bin = (int)(x * invBoxX * gridx);
+        if (bin < 0) bin = 0;
+        if (bin >= gridx) bin = gridx - 1;
+        binOf[i] = bin;
+        binCount[bin]++;
+    }
+    // Prefix sum to compute output offsets.
+    std::vector<int> cursor(gridx);
+    int running = 0;
+    for (int b = 0; b < gridx; b++) {
+        cursor[b] = running;
+        running += binCount[b];
+    }
+    // Scatter to sortedIndices.
+    for (int i = 0; i < numParticles; i++)
+        sortedIndices[cursor[binOf[i]]++] = i;
+}
+
 static void spreadCharge(float* posq, vector<float>& grid, int gridx, int gridy, int gridz, int numParticles, Vec3* periodicBoxVectors, Vec3* recipBoxVectors,
-        atomic<int>& atomicCounter, const float epsilonFactor, int threadIndex, int numThreads, bool deterministic) {
+        const std::vector<int>& sortedIndices, atomic<int>& atomicCounter, const float epsilonFactor, int threadIndex, int numThreads, bool deterministic) {
     float temp[4];
     fvec4 boxSize((float) periodicBoxVectors[0][0], (float) periodicBoxVectors[1][1], (float) periodicBoxVectors[2][2], 0);
     fvec4 invBoxSize((float) recipBoxVectors[0][0], (float) recipBoxVectors[1][1], (float) recipBoxVectors[2][2], 0);
@@ -80,7 +115,8 @@ static void spreadCharge(float* posq, vector<float>& grid, int gridx, int gridy,
             break;
 
         int end = min(start + groupSize, numParticles);
-        for (int i = start; i < end; ++i) {
+        for (int s = start; s < end; ++s) {
+            int i = sortedIndices[s];  // spatially-sorted particle index
             // Find the position relative to the nearest grid point.
 
             fvec4 pos(&posq[4*i]);
@@ -644,6 +680,12 @@ void CpuCalcPmeReciprocalForceKernel::runMainThread() {
             break;
         posq = io->getPosq();
         atomicCounter = 0;
+        // Bucket-sort particles by X-bin so the spread loop visits them in
+        // spatial order (cache locality). Done on the main thread before
+        // signaling workers - adding it inside runWorkerThread would require
+        // an extra syncThreads barrier that the main thread doesn't match
+        // with a resumeThreads call, deadlocking the workers.
+        buildSortedIndices(posq, numParticles, gridx, periodicBoxVectors, recipBoxVectors, sortedIndices);
         threads.execute([&] (ThreadPool& threads, int threadIndex) { runWorkerThread(threads, threadIndex); }); // Signal threads to perform charge spreading.
         threads.waitForThreads();
         threads.resumeThreads(); // Signal threads to sum the charge grids.
@@ -699,7 +741,8 @@ void CpuCalcPmeReciprocalForceKernel::runWorkerThread(ThreadPool& threads, int i
     int complexStart = std::max(1, ((index*complexSize)/numThreads));
     int complexEnd = (((index+1)*complexSize)/numThreads);
     const float epsilonFactor = sqrt(ONE_4PI_EPS0);
-    spreadCharge(posq, realGrids[index], gridx, gridy, gridz, numParticles, periodicBoxVectors, recipBoxVectors, atomicCounter, epsilonFactor, index, numThreads, deterministic);
+    // sortedIndices is built on the main thread before threads.execute(); see runMainThread.
+    spreadCharge(posq, realGrids[index], gridx, gridy, gridz, numParticles, periodicBoxVectors, recipBoxVectors, sortedIndices, atomicCounter, epsilonFactor, index, numThreads, deterministic);
     threads.syncThreads();
     int numGrids = realGrids.size();
     for (int i = gridStart; i < gridEnd; i += 4) {
@@ -946,6 +989,8 @@ void CpuCalcDispersionPmeReciprocalForceKernel::runMainThread() {
         posq = io->getPosq();
         ComputeTask task(*this);
         atomicCounter = 0;
+        // Bucket-sort particles by X-bin before signaling workers (see PME runMainThread for rationale).
+        buildSortedIndices(posq, numParticles, gridx, periodicBoxVectors, recipBoxVectors, sortedIndices);
         threads.execute(task); // Signal threads to perform charge spreading.
         threads.waitForThreads();
         threads.resumeThreads(); // Signal threads to sum the charge grids.
@@ -985,7 +1030,8 @@ void CpuCalcDispersionPmeReciprocalForceKernel::runWorkerThread(ThreadPool& thre
     int complexStart = std::max(1, ((index*complexSize)/numThreads));
     int complexEnd = (((index+1)*complexSize)/numThreads);
     const float epsilonFactor = 1.0f;
-    spreadCharge(posq, realGrids[index], gridx, gridy, gridz, numParticles, periodicBoxVectors, recipBoxVectors, atomicCounter, epsilonFactor, index, numThreads, deterministic);
+    // sortedIndices built on main thread before threads.execute(); see runMainThread.
+    spreadCharge(posq, realGrids[index], gridx, gridy, gridz, numParticles, periodicBoxVectors, recipBoxVectors, sortedIndices, atomicCounter, epsilonFactor, index, numThreads, deterministic);
     threads.syncThreads();
     int numGrids = realGrids.size();
     for (int i = gridStart; i < gridEnd; i += 4) {
