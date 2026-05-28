@@ -55,9 +55,18 @@ static const int PME_ORDER = 5;
 bool CpuCalcDispersionPmeReciprocalForceKernel::hasInitializedThreads = false;
 int CpuCalcDispersionPmeReciprocalForceKernel::numThreads = 0;
 
+// Rebuild the spatial sort order every SORT_CADENCE steps. In MD, atom
+// positions move very little between steps (this is also why neighbor lists
+// are rebuilt only every ~10-20 steps), so a slightly stale sort order is
+// still a good spatial ordering - and ANY permutation of particle indices is
+// correct (it only changes the order of additions to grid cells, up to FP
+// associativity). Amortizing the sort makes its single-threaded cost
+// negligible per step while keeping the cache-locality benefit during spread.
+static const int SORT_CADENCE = 20;
+
 // Bucket-sort particle indices by X-bin so the spread loop visits particles in
 // spatial order. Improves cache locality of grid writes (consecutive particles
-// touch nearby grid cells). Called once per step by thread 0 only.
+// touch nearby grid cells). Called from the main thread.
 static void buildSortedIndices(const float* posq, int numParticles, int gridx,
                                const Vec3* periodicBoxVectors,
                                const Vec3* recipBoxVectors,
@@ -684,8 +693,13 @@ void CpuCalcPmeReciprocalForceKernel::runMainThread() {
         // spatial order (cache locality). Done on the main thread before
         // signaling workers - adding it inside runWorkerThread would require
         // an extra syncThreads barrier that the main thread doesn't match
-        // with a resumeThreads call, deadlocking the workers.
-        buildSortedIndices(posq, numParticles, gridx, periodicBoxVectors, recipBoxVectors, sortedIndices);
+        // with a resumeThreads call, deadlocking the workers. Rebuilt only
+        // every SORT_CADENCE steps to amortize the single-threaded sort cost;
+        // a stale order is still valid (any permutation is correct).
+        if (sortStepCounter == 0 || (int)sortedIndices.size() != numParticles)
+            buildSortedIndices(posq, numParticles, gridx, periodicBoxVectors, recipBoxVectors, sortedIndices);
+        if (++sortStepCounter >= SORT_CADENCE)
+            sortStepCounter = 0;
         threads.execute([&] (ThreadPool& threads, int threadIndex) { runWorkerThread(threads, threadIndex); }); // Signal threads to perform charge spreading.
         threads.waitForThreads();
         threads.resumeThreads(); // Signal threads to sum the charge grids.
@@ -990,7 +1004,11 @@ void CpuCalcDispersionPmeReciprocalForceKernel::runMainThread() {
         ComputeTask task(*this);
         atomicCounter = 0;
         // Bucket-sort particles by X-bin before signaling workers (see PME runMainThread for rationale).
-        buildSortedIndices(posq, numParticles, gridx, periodicBoxVectors, recipBoxVectors, sortedIndices);
+        // Rebuilt only every SORT_CADENCE steps; a stale order is still valid.
+        if (sortStepCounter == 0 || (int)sortedIndices.size() != numParticles)
+            buildSortedIndices(posq, numParticles, gridx, periodicBoxVectors, recipBoxVectors, sortedIndices);
+        if (++sortStepCounter >= SORT_CADENCE)
+            sortStepCounter = 0;
         threads.execute(task); // Signal threads to perform charge spreading.
         threads.waitForThreads();
         threads.resumeThreads(); // Signal threads to sum the charge grids.

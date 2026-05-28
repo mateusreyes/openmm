@@ -125,6 +125,7 @@ private:
     std::vector<float> threadEnergy;
     std::vector<std::vector<float> > realGrids;
     std::vector<int> sortedIndices;
+    int sortStepCounter = 0;
     std::vector<std::complex<float> > complexGrid;
     std::vector<std::size_t> gridShape, fftAxes;
     std::vector<std::ptrdiff_t> realGridStride, complexGridStride;
@@ -220,6 +221,7 @@ private:
     std::vector<float> threadEnergy;
     std::vector<std::vector<float> > realGrids;
     std::vector<int> sortedIndices;
+    int sortStepCounter = 0;
     std::vector<std::complex<float> > complexGrid;
     std::vector<std::size_t> gridShape, fftAxes;
     std::vector<std::ptrdiff_t> realGridStride, complexGridStride;
